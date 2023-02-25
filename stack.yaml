@@ -1,0 +1,192 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Start Stop ECS Fargate Scheduler with SNS Notification - Antoine Cichowicz | Github: Yris Ops'
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: The email address to receive the notification
+
+  ClusterRegion:
+    Type: String
+    Default: "us-east-1"
+
+  ClusterECS:
+    Type: String
+
+  ServiceNameECS:
+    Type: String
+
+  ServiceECS:
+    Type: String
+
+  CronStart:
+    Type: String
+    Default: 0 9 ? * MON-FRI *
+
+  CronStop:
+    Type: String
+    Default: 00 18 ? * MON-FRI * 
+
+Resources:
+  SNSTopicECSFargateLambda:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: !Sub 'Fargate Event Triggered Cluster: "${ClusterECS}"'
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  StartStopECSFargateRole:
+    Type: AWS::IAM::Role
+    DependsOn: StartStopECSFargatePolicy
+    Properties:
+      RoleName: StartStopECSFargateSchedulerRole
+      ManagedPolicyArns:
+        - Ref: StartStopECSFargatePolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: "/"   
+      Policies:
+      - PolicyName: 'lambda-execution-policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Ref SNSTopicECSFargateLambda
+
+  StartStopECSFargateProfile:  
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: StartStopECSFargateInstanceProfile
+      Path: "/"
+      Roles:
+        - Ref: StartStopECSFargateRole  
+
+  StartStopECSFargatePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:       
+      ManagedPolicyName: StartStopECSFargateSchedulerPolicy
+      Description: Allow Lambda function to call CloudWatch logging, ECS all, and SNS write service actions.
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "arn:aws:logs:*:*:*"       
+          - Effect: Allow
+            Action: 
+              - ecs:updateService
+            Resource: "*"   
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: "*"     
+
+  CloudwatchSchedulerStart:
+    Type: AWS::Events::Rule
+    DependsOn: StartStopECSFargateFunction
+    Properties:
+      Description: Trigger to Lambda function to startup ECS tasks in the morning (UTC).
+      ScheduleExpression: !Sub 'cron(${CronStart})'     
+      Name: StartECSFargateSchedulerRule
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt StartStopECSFargateFunction.Arn
+          Id: stat-stop-ecs-fargate
+          Input: !Sub '{"status": "start", "ECS_CLUSTER": "${ClusterECS}", "ECS_SERVICE_NAME": "${ServiceNameECS}", "service": "${ServiceECS}"}'
+
+  CloudwatchSchedulerStop:
+    Type: AWS::Events::Rule
+    DependsOn: StartStopECSFargateFunction
+    Properties:
+      Description: Trigger to Lambda function to shutdown ECS tasks in the evening (UTC).
+      ScheduleExpression: !Sub 'cron(${CronStop})'      
+      Name: StopECSFargateSchedulerRule
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt StartStopECSFargateFunction.Arn
+          Id: stat-stop-ecs-fargate
+          Input: !Sub '{"status": "stop", "ECS_CLUSTER": "${ClusterECS}", "ECS_SERVICE_NAME": "${ServiceNameECS}", "service": "${ServiceECS}"}'
+
+  StartInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt StartStopECSFargateFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudwatchSchedulerStart.Arn     
+
+  StopInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt StartStopECSFargateFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudwatchSchedulerStop.Arn  
+
+  StartStopECSFargateFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StartStopECSFargateRole
+    Properties:
+      Description: Function for Start and Stop Fargate tasks during non-business hours.
+      Code:
+        ZipFile: >
+          const aws = require('aws-sdk'); exports.handler = (event, context) => {
+              var ecsRegion = process.env.LambdaRegion || 'us-east-1';
+              var ECS_CLUSTER = process.env.ECS_CLUSTER;
+              var ECS_SERVICE_NAME = process.env.ECS_SERVICE_NAME;
+              const status_string = event.status == 'stop' ? 'Start' : 'Stop';
+              if(event.status == 'stop'){
+                  var params = {
+                      cluster: ECS_CLUSTER,
+                      service: ECS_SERVICE_NAME,
+                      desiredCount: 0
+                      };
+              } else{
+                  var params = {
+                      cluster: ECS_CLUSTER,
+                      service: ECS_SERVICE_NAME,
+                      desiredCount: 1
+                  };
+              }
+              var ecs = new aws.ECS({region: ecsRegion});
+                  ecs.updateService(params, function (err, data) {
+                      if (err) console.log(err, err.stack); // an error oc
+                    else {
+                    const sns = new aws.SNS({region: process.env.LambdaRegion});
+                    const message = `Fargate ${status_string} event triggered for ${process.env.ECS_SERVICE_NAME} service in ${process.env.ECS_CLUSTER} cluster\n\nhttps://github.com/Yris-ops`;
+                    const snsParams = {
+                      Message: message,
+                      TopicArn: process.env.SNSTopicLambda
+                    };
+                    sns.publish(snsParams, function(err, data) {
+                      if (err) console.log(err, err.stack);
+                      else console.log(`SNS message published: ${message}`);
+                    });
+                    context.succeed();
+                  }
+              });
+          }; 
+      FunctionName: StatStopECSFargateSchedulerFunction
+      Handler: 'index.handler'
+      Role: !GetAtt StartStopECSFargateRole.Arn
+      Runtime: 'nodejs16.x'
+      Timeout: 300  
+      Environment:
+        Variables:
+          LambdaRegion: !Ref ClusterRegion
+          ECS_CLUSTER: !Ref ClusterECS
+          ECS_SERVICE_NAME: !Ref ServiceNameECS
+          SNSTopicLambda: !Ref SNSTopicECSFargateLambda
